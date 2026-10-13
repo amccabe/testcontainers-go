@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 	"syscall"
@@ -16,10 +18,12 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/require"
 
 	"github.com/testcontainers/testcontainers-go/internal/config"
 	"github.com/testcontainers/testcontainers-go/internal/core"
+	"github.com/testcontainers/testcontainers-go/log"
 )
 
 // testSessionID the tests need to create a reaper in a different session, so that it does not interfere with other tests
@@ -345,6 +349,90 @@ func testNewReaper(ctx context.Context, t *testing.T, cfg config.Config, expecte
 	require.Equal(t, container.NetworkMode(Bridge), provider.hostConfig.NetworkMode, "expected networkMode doesn't match the submitted request")
 	require.True(t, provider.hostConfig.AutoRemove, "expected networkMode doesn't match the submitted request")
 	require.Equal(t, privileged, provider.hostConfig.Privileged, "expected privileged doesn't match the submitted request")
+}
+
+// reaperCreateMockCli is a mock implementation of client.APIClient that
+// records the options of the container create call and fails it, so that
+// no container is started.
+type reaperCreateMockCli struct {
+	client.APIClient
+
+	createOpts *client.ContainerCreateOptions
+}
+
+func (m *reaperCreateMockCli) ImageInspect(context.Context, string, ...client.ImageInspectOption) (client.ImageInspectResult, error) {
+	return client.ImageInspectResult{}, nil
+}
+
+func (m *reaperCreateMockCli) NetworkInspect(_ context.Context, name string, _ client.NetworkInspectOptions) (client.NetworkInspectResult, error) {
+	var nw network.Inspect
+	nw.Name = name
+	return client.NetworkInspectResult{Network: nw}, nil
+}
+
+func (m *reaperCreateMockCli) ContainerCreate(_ context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
+	m.createOpts = &opts
+	return client.ContainerCreateResult{}, errExpected
+}
+
+func (m *reaperCreateMockCli) Close() error {
+	return nil
+}
+
+func Test_NewReaper_networks(t *testing.T) {
+	ctx := context.WithValue(context.Background(), core.DockerHostContextKey, core.DockerSocketPathWithSchema)
+
+	tests := []struct {
+		name string
+		// bridgeNetwork is the provider's default bridge network name.
+		bridgeNetwork string
+		// defaultNetwork is the network the provider found or created.
+		defaultNetwork string
+		wantEndpoints  []string
+	}{
+		{
+			name:           "docker-bridge",
+			bridgeNetwork:  Bridge,
+			defaultNetwork: Bridge,
+		},
+		{
+			name:           "podman-bridge",
+			bridgeNetwork:  Podman,
+			defaultNetwork: Podman,
+		},
+		{
+			name:           "reaper-default",
+			bridgeNetwork:  Bridge,
+			defaultNetwork: ReaperDefault,
+			wantEndpoints:  []string{ReaperDefault},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cli := &reaperCreateMockCli{}
+			provider := &DockerProvider{
+				DockerProviderOptions: &DockerProviderOptions{
+					defaultBridgeNetworkName: tt.bridgeNetwork,
+					GenericProviderOptions: &GenericProviderOptions{
+						Logger:         log.Default(),
+						defaultNetwork: tt.defaultNetwork,
+					},
+				},
+				client: cli,
+			}
+
+			spawner := &reaperSpawner{}
+			reaper, err := spawner.newReaper(ctx, testSessionID, provider)
+			// We should have errored out see reaperCreateMockCli.ContainerCreate.
+			require.ErrorIs(t, err, errExpected)
+			require.Nil(t, reaper)
+
+			require.NotNil(t, cli.createOpts)
+			require.Equal(t, container.NetworkMode(Bridge), cli.createOpts.HostConfig.NetworkMode)
+			require.Equal(t, tt.wantEndpoints, slices.Sorted(maps.Keys(cli.createOpts.NetworkingConfig.EndpointsConfig)))
+		})
+	}
 }
 
 func Test_ReaperReusedIfHealthy(t *testing.T) {

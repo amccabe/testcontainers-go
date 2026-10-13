@@ -419,14 +419,18 @@ func (r *reaperSpawner) newReaper(ctx context.Context, sessionID string, provide
 	req.Labels[core.LabelRyuk] = "true"
 	delete(req.Labels, core.LabelReap)
 
-	// Attach reaper container to a requested network if it is specified
+	// Attach the reaper container to the default network when it is not the
+	// bridge network, which NetworkMode already selects. Podman lists its
+	// default network as "bridge" but rejects an endpoint of that name.
 	if p, ok := provider.(*DockerProvider); ok {
 		defaultNetwork, err := p.ensureDefaultNetwork(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("ensure default network: %w", err)
 		}
 
-		req.Networks = append(req.Networks, defaultNetwork)
+		if defaultNetwork != p.defaultBridgeNetworkName {
+			req.Networks = append(req.Networks, defaultNetwork)
+		}
 	}
 
 	c, err := provider.RunContainer(ctx, req)
